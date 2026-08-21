@@ -49,3 +49,8 @@ from unnest(array[
 where not exists (
   select 1 from public.multiplication_students where lower(name) = lower(student_name)
 );
+
+
+-- Explicit API permissions for student devices and the teacher dashboard.
+grant select, insert on public.multiplication_attempts to anon, authenticated;
+grant select, insert, update, delete on public.multiplication_students to anon, authenticated;

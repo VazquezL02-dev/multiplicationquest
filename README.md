@@ -42,3 +42,7 @@ This version deliberately uses `public.multiplication_students` so it will not c
 - Question generation now uses a shuffled deck of unique multiplication facts. A fact will not repeat until the available facts for the selected tables have been used.
 - Teacher mode is now rendered separately from student play and clears any selected student when opened.
 - No Supabase schema change is required for this update; existing `duration_seconds` and `accuracy` attempt data is used.
+
+
+## Sync fix / live teacher results
+If student rounds appear on the iPad but not on the teacher dashboard, run `supabase-sync-fix.sql` once in Supabase SQL Editor. The app now shows a save confirmation after every round and the teacher dashboard refreshes from Supabase every 5 seconds.

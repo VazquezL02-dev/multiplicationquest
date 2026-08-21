@@ -31,7 +31,9 @@ const state = {
   teacherUnlocked: false,
   cloud: cloudEnabled,
   questionDeck: [],
-  lastQuestionKey: null
+  lastQuestionKey: null,
+  dashboardRefreshTimer: null,
+  lastSyncStatus: ''
 }
 
 function uid() {
@@ -65,12 +67,18 @@ async function loadCloud() {
     if (error) throw error
     state.students = inserted || seededStudents
   }
-  if (attempts) state.attempts = attempts
+  if (attempts) {
+    const pendingLocal = state.attempts.filter(a => a._pending_sync && !attempts.some(c => c.id === a.id))
+    state.attempts = [...pendingLocal, ...attempts]
+  }
 }
 
 async function initialise() {
   loadLocal()
-  try { await loadCloud() } catch (e) { console.warn('Using local mode', e) }
+  try {
+    await retryPendingAttempts()
+    await loadCloud()
+  } catch (e) { console.warn('Using local mode', e) }
   render()
 }
 
@@ -193,6 +201,7 @@ function resultsView(last) {
         <div><strong>${accuracy}%</strong><span>Accuracy</span></div>
         <div><strong>${last.best_streak}</strong><span>Best streak</span></div>
       </div>
+      <div class="sync-status">${escapeHtml(state.lastSyncStatus || (state.cloud ? 'Checking cloud save…' : 'Saved on this device only'))}</div>
       <button class="primary full" data-action="play-again">Play again</button>
       <button class="secondary full" data-action="home">Finish</button>
     </section>
@@ -218,7 +227,7 @@ function teacherView() {
   }).join('')
   teacherShell(`
     <section class="dashboard-head card teacher-only">
-      <div><span class="eyebrow">Teacher dashboard</span><h2>Class multiplication fluency</h2><p>Compare accuracy and speed fairly across 1, 2 and 3 minute rounds.</p></div>
+      <div><span class="eyebrow">Teacher dashboard</span><h2>Class multiplication fluency</h2><p>Compare accuracy and speed fairly across 1, 2 and 3 minute rounds. <strong>Live results refresh automatically.</strong></p></div>
       <div class="toolbar"><button class="secondary" data-action="export-csv">Export CSV</button><button class="ghost" data-action="refresh-data">Refresh</button></div>
     </section>
     <section class="grid-3 teacher-only">
@@ -284,13 +293,15 @@ function escapeHtml(s='') { return s.replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&l
 
 function render() {
   clearInterval(state.timer)
+  clearInterval(state.dashboardRefreshTimer)
+  state.dashboardRefreshTimer = null
   if (state.view==='home') homeView()
   if (state.view==='student-login') studentLoginView()
   if (state.view==='setup') setupView()
   if (state.view==='game') gameView()
   if (state.view==='results') resultsView(state.attempts[0])
   if (state.view==='teacher-login') teacherLoginView()
-  if (state.view==='teacher') teacherView()
+  if (state.view==='teacher') { teacherView(); startTeacherAutoRefresh() }
 }
 
 function shuffle(items) {
@@ -371,10 +382,56 @@ function submitAnswer() {
 
 async function finishRound() {
   clearInterval(state.timer)
-  const attempt={id:uid(),student_id:state.currentStudent.id,score:state.score,correct:state.correct,total:state.total,accuracy:state.total?Math.round(state.correct/state.total*100):0,best_streak:state.bestStreak,duration_seconds:state.duration,tables:state.selectedTables,created_at:new Date().toISOString()}
-  state.attempts.unshift(attempt);saveLocal()
-  if(supabase){try{await supabase.from('multiplication_attempts').insert(attempt)}catch(e){console.warn(e)}}
-  state.view='results';render()
+  const attempt={id:uid(),student_id:state.currentStudent.id,score:state.score,correct:state.correct,total:state.total,accuracy:state.total?Math.round(state.correct/state.total*100):0,best_streak:state.bestStreak,duration_seconds:state.duration,tables:state.selectedTables,created_at:new Date().toISOString(),_pending_sync:Boolean(supabase)}
+  state.attempts.unshift(attempt)
+  saveLocal()
+  state.lastSyncStatus = supabase ? 'Saving to teacher dashboard…' : 'Saved on this device only — Supabase is not connected.'
+  state.view='results'
+  render()
+
+  if (supabase) {
+    try {
+      await saveAttemptToCloud(attempt)
+      attempt._pending_sync = false
+      state.lastSyncStatus = '✓ Saved to teacher dashboard'
+      saveLocal()
+    } catch (e) {
+      console.error('Could not save multiplication attempt to Supabase:', e)
+      state.lastSyncStatus = '⚠ Saved on this iPad, but not synced to the teacher dashboard yet.'
+      saveLocal()
+    }
+    if (state.view === 'results') render()
+  }
+}
+
+async function saveAttemptToCloud(attempt) {
+  const cloudAttempt = {
+    id: attempt.id,
+    student_id: attempt.student_id,
+    score: attempt.score,
+    correct: attempt.correct,
+    total: attempt.total,
+    accuracy: attempt.accuracy,
+    best_streak: attempt.best_streak,
+    duration_seconds: attempt.duration_seconds,
+    tables: attempt.tables,
+    created_at: attempt.created_at
+  }
+  await supabase.from('multiplication_attempts').insert(cloudAttempt)
+}
+
+async function retryPendingAttempts() {
+  if (!supabase) return
+  const pending = state.attempts.filter(a => a._pending_sync)
+  for (const attempt of pending) {
+    try {
+      await saveAttemptToCloud(attempt)
+      attempt._pending_sync = false
+    } catch (e) {
+      console.warn('Pending attempt still could not sync', e)
+    }
+  }
+  if (pending.length) saveLocal()
 }
 
 async function addStudent(name) {
@@ -384,6 +441,19 @@ async function addStudent(name) {
 }
 async function updateStudent(id,name){const s=state.students.find(x=>x.id===id);if(!s)return;s.name=name.trim();state.students.sort((a,b)=>a.name.localeCompare(b.name));saveLocal();if(supabase)await supabase.from('multiplication_students').update({name:s.name}).eq('id',id)}
 async function deleteStudent(id){state.students=state.students.filter(s=>s.id!==id);saveLocal();if(supabase)await supabase.from('multiplication_students').delete().eq('id',id)}
+
+function startTeacherAutoRefresh() {
+  if (!supabase || state.view !== 'teacher') return
+  state.dashboardRefreshTimer = setInterval(async () => {
+    if (state.view !== 'teacher') return
+    try {
+      await loadCloud()
+      if (state.view === 'teacher') teacherView()
+    } catch (e) {
+      console.warn('Teacher dashboard auto-refresh failed', e)
+    }
+  }, 5000)
+}
 
 function exportCsv(){
   const rows=[['Student','Score','Accuracy','Correct','Total','Best streak','Duration','Tables','Date']]
